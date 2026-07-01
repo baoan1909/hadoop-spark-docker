@@ -1,72 +1,74 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-if [ -n "${HADOOP_DATANODE_UI_PORT}" ]; then
-  echo "Replacing default datanode UI port 9864 with ${HADOOP_DATANODE_UI_PORT}"
-  sed -i "$ i\<property><name>dfs.datanode.http.address</name><value>0.0.0.0:${HADOOP_DATANODE_UI_PORT}</value></property>" ${HADOOP_CONF_DIR}/hdfs-site.xml
-fi
-if [ "${HADOOP_NODE}" == "namenode" ]; then
-  echo "Starting Hadoop name node..."
-  yes | hdfs namenode -format
-  hdfs --daemon start namenode
-  hdfs --daemon start secondarynamenode
-  yarn --daemon start resourcemanager
-  mapred --daemon start historyserver
-fi
-if [ "${HADOOP_NODE}" == "datanode" ]; then
-  echo "Starting Hadoop data node..."
-  hdfs --daemon start datanode
-  yarn --daemon start nodemanager
-fi
+wait_for() {
+  local preconditions="${SERVICE_PRECONDITION:-}"
+  local host port
 
-if [ -n "${HIVE_CONFIGURE}" ]; then
-  echo "Configuring Hive..."
-  schematool -dbType postgres -initSchema
+  for endpoint in $preconditions; do
+    host="${endpoint%:*}"
+    port="${endpoint##*:}"
 
-  # Start metastore service.
-  hive --service metastore &
+    if [[ -z "$host" || -z "$port" || "$host" == "$port" ]]; then
+      continue
+    fi
 
-  # JDBC Server.
-  hiveserver2 &
-fi
+    printf 'Waiting for %s:%s' "$host" "$port"
+    until nc -z "$host" "$port" >/dev/null 2>&1; do
+      printf '.'
+      sleep 2
+    done
+    printf ' ready\n'
+  done
+}
 
-if [ -z "${SPARK_MASTER_ADDRESS}" ]; then
-  echo "Starting Spark master node..."
-  # Create directory for Spark logs
-  SPARK_LOGS_HDFS_PATH=/log/spark
-  if ! hadoop fs -test -d "${SPARK_LOGS_HDFS_PATH}"
-  then
-    hadoop fs -mkdir -p  ${SPARK_LOGS_HDFS_PATH}
-    hadoop fs -chmod -R 755 ${SPARK_LOGS_HDFS_PATH}/*
-  fi
+/usr/local/bin/configure-hadoop-spark
+wait_for
 
-  # Spark on YARN
-  SPARK_JARS_HDFS_PATH=/spark-jars
-  if ! hadoop fs -test -d "${SPARK_JARS_HDFS_PATH}"
-  then
-    hadoop dfs -copyFromLocal "${SPARK_HOME}/jars" "${SPARK_JARS_HDFS_PATH}"
-  fi
+role="${1:-}"
+shift || true
 
-  "${SPARK_HOME}/sbin/start-master.sh" -h master &
-  "${SPARK_HOME}/sbin/start-history-server.sh" &
-else
-  echo "Starting Spark slave node..."
-  "${SPARK_HOME}/sbin/start-slave.sh" "${SPARK_MASTER_ADDRESS}" &
+if [[ -z "$role" && "${HADOOP_NODE:-}" == "namenode" ]]; then
+  role="namenode"
+elif [[ -z "$role" && "${HADOOP_NODE:-}" == "datanode" ]]; then
+  role="datanode"
 fi
 
-echo "All initializations finished!"
-
-# Blocking call to view all logs. This is what won't let container exit right away.
-/scripts/parallel_commands.sh "scripts/watchdir ${HADOOP_LOG_DIR}" "scripts/watchdir ${SPARK_LOG_DIR}"
-
-# Stop all
-if [ "${HADOOP_NODE}" == "namenode" ]; then
-  hdfs namenode -format
-  hdfs --daemon stop namenode
-  hdfs --daemon stop secondarynamenode
-  yarn --daemon stop resourcemanager
-  mapred --daemon stop historyserver
-fi
-if [ "${HADOOP_NODE}" == "datanode" ]; then
-  hdfs --daemon stop datanode
-  yarn --daemon stop nodemanager
-fi
+case "$role" in
+  namenode)
+    if [[ ! -f /hadoop/dfs/name/current/VERSION ]]; then
+      "${HADOOP_HOME}/bin/hdfs" namenode -format -force -nonInteractive "${CLUSTER_NAME:-hadoop-cluster}"
+    fi
+    exec "${HADOOP_HOME}/bin/hdfs" namenode "$@"
+    ;;
+  datanode)
+    exec "${HADOOP_HOME}/bin/hdfs" datanode "$@"
+    ;;
+  resourcemanager)
+    exec "${HADOOP_HOME}/bin/yarn" resourcemanager "$@"
+    ;;
+  nodemanager)
+    exec "${HADOOP_HOME}/bin/yarn" nodemanager "$@"
+    ;;
+  spark-master)
+    exec "${SPARK_HOME}/bin/spark-class" org.apache.spark.deploy.master.Master \
+      --host "${SPARK_MASTER_HOST:-$(hostname)}" \
+      --port "${SPARK_MASTER_PORT:-7077}" \
+      --webui-port "${SPARK_MASTER_WEBUI_PORT:-8080}" \
+      "$@"
+    ;;
+  spark-worker)
+    exec "${SPARK_HOME}/bin/spark-class" org.apache.spark.deploy.worker.Worker \
+      --port "${SPARK_WORKER_PORT:-7078}" \
+      --webui-port "${SPARK_WORKER_WEBUI_PORT:-8081}" \
+      "${SPARK_MASTER:-spark://baoan-master:7077}" \
+      "$@"
+    ;;
+  bash|sh)
+    exec "$role" "$@"
+    ;;
+  *)
+    echo "Usage: $0 {namenode|datanode|resourcemanager|nodemanager|spark-master|spark-worker}"
+    exit 1
+    ;;
+esac

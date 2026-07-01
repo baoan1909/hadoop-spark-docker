@@ -1,3 +1,3 @@
-# The java implementation to use. By default, this environment
-# variable is REQUIRED on ALL platforms except OS X!
-export JAVA_HOME=/usr/lib/jvm/java-1.8-openjdk
+export JAVA_HOME=/opt/java/openjdk
+export HADOOP_HOME=/opt/hadoop
+export HADOOP_CONF_DIR=/opt/hadoop/etc/hadoop
